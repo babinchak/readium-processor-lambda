@@ -28,17 +28,16 @@ func TestHandler_MissingEnvVars(t *testing.T) {
 	ctx := context.Background()
 	teardownTestEnv()
 
+	bodyJSON, _ := json.Marshal(map[string]string{"filename": "test.epub"})
 	request := events.LambdaFunctionURLRequest{
 		RequestContext: events.LambdaFunctionURLRequestContext{
 			HTTP: events.LambdaFunctionURLRequestContextHTTPDescription{
-				Method: "GET",
+				Method: "POST",
 				Path:   "/",
 			},
 		},
 		RawPath: "/",
-		QueryStringParameters: map[string]string{
-			"filename": "test.epub",
-		},
+		Body:    string(bodyJSON),
 	}
 
 	response, err := handler(ctx, request)
@@ -58,7 +57,7 @@ func TestHandler_MissingEnvVars(t *testing.T) {
 	setupTestEnv()
 }
 
-func TestHandler_MissingFilename(t *testing.T) {
+func TestHandler_MethodNotAllowed(t *testing.T) {
 	ctx := context.Background()
 	setupTestEnv()
 	defer teardownTestEnv()
@@ -71,6 +70,41 @@ func TestHandler_MissingFilename(t *testing.T) {
 			},
 		},
 		RawPath: "/",
+	}
+
+	response, err := handler(ctx, request)
+	if err != nil {
+		t.Fatalf("Handler returned error: %v", err)
+	}
+
+	if response.StatusCode != 405 {
+		t.Errorf("Expected status 405, got %d", response.StatusCode)
+	}
+
+	var errorBody ErrorResponse
+	if err := json.Unmarshal([]byte(response.Body), &errorBody); err != nil {
+		t.Fatalf("Failed to unmarshal error response: %v", err)
+	}
+
+	if errorBody.Status != 405 {
+		t.Errorf("Expected error status 405, got %d", errorBody.Status)
+	}
+}
+
+func TestHandler_MissingFilename(t *testing.T) {
+	ctx := context.Background()
+	setupTestEnv()
+	defer teardownTestEnv()
+
+	request := events.LambdaFunctionURLRequest{
+		RequestContext: events.LambdaFunctionURLRequestContext{
+			HTTP: events.LambdaFunctionURLRequestContextHTTPDescription{
+				Method: "POST",
+				Path:   "/",
+			},
+		},
+		RawPath: "/",
+		Body:    "{}",
 	}
 
 	response, err := handler(ctx, request)
@@ -97,17 +131,16 @@ func TestHandler_InvalidFilename_PathTraversal(t *testing.T) {
 	setupTestEnv()
 	defer teardownTestEnv()
 
+	bodyJSON, _ := json.Marshal(map[string]string{"filename": "../../etc/passwd"})
 	request := events.LambdaFunctionURLRequest{
 		RequestContext: events.LambdaFunctionURLRequestContext{
 			HTTP: events.LambdaFunctionURLRequestContextHTTPDescription{
-				Method: "GET",
+				Method: "POST",
 				Path:   "/",
 			},
 		},
 		RawPath: "/",
-		QueryStringParameters: map[string]string{
-			"filename": "../../etc/passwd",
-		},
+		Body:    string(bodyJSON),
 	}
 
 	response, err := handler(ctx, request)
@@ -125,50 +158,12 @@ func TestHandler_InvalidFilename_PathTraversal(t *testing.T) {
 	}
 }
 
-func TestHandler_FilenameInQueryParams(t *testing.T) {
-	ctx := context.Background()
-	setupTestEnv()
-	defer teardownTestEnv()
-
-	// Note: This test will fail if the file doesn't exist in Supabase
-	// For integration testing, use a real Supabase instance or mock the HTTP client
-	testFilename := "8f1acca6-4d96-410c-ba90-bfa06c451b72/c9170176-8372-48c7-897d-f6bfe6ea3eef.epub"
-
-	request := events.LambdaFunctionURLRequest{
-		RequestContext: events.LambdaFunctionURLRequestContext{
-			HTTP: events.LambdaFunctionURLRequestContextHTTPDescription{
-				Method: "GET",
-				Path:   "/",
-			},
-		},
-		RawPath: "/",
-		QueryStringParameters: map[string]string{
-			"filename": testFilename,
-		},
-	}
-
-	response, err := handler(ctx, request)
-	if err != nil {
-		t.Fatalf("Handler returned error: %v", err)
-	}
-
-	// This will likely return 500 if the file doesn't exist, which is expected
-	// For a real test, you'd need a valid Supabase setup or mock the HTTP client
-	if response.StatusCode < 400 {
-		var body Response
-		if err := json.Unmarshal([]byte(response.Body), &body); err != nil {
-			t.Fatalf("Failed to unmarshal response: %v", err)
-		}
-		t.Logf("Response: %+v", body)
-	}
-}
-
 func TestHandler_FilenameInBody(t *testing.T) {
 	ctx := context.Background()
 	setupTestEnv()
 	defer teardownTestEnv()
 
-	testFilename := "test-folder/test.epub"
+	testFilename := "8f1acca6-4d96-410c-ba90-bfa06c451b72/c9170176-8372-48c7-897d-f6bfe6ea3eef.epub"
 	bodyJSON, _ := json.Marshal(map[string]string{"filename": testFilename})
 
 	request := events.LambdaFunctionURLRequest{

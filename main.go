@@ -35,6 +35,11 @@ const (
 func handler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	log.Printf("Received request: Method=%s, Path=%s", request.RequestContext.HTTP.Method, request.RawPath)
 
+	// Only allow POST requests since this operation mutates server state
+	if request.RequestContext.HTTP.Method != "POST" {
+		return createErrorResponse(405, "Method not allowed. This endpoint only accepts POST requests."), nil
+	}
+
 	// Get Supabase configuration from environment variables
 	supabaseURL := os.Getenv(supabaseURLEnvVar)
 	supabaseServiceKey := os.Getenv(supabaseServiceKeyEnvVar)
@@ -47,18 +52,10 @@ func handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 		return createErrorResponse(500, "SUPABASE_SERVICE_ROLE_KEY environment variable is not set"), nil
 	}
 
-	// Extract EPUB filename from query parameters or request body
+	// Extract EPUB filename from request body
 	var epubFilename string
 
-	// Try query parameter first
-	if queryParams := request.QueryStringParameters; queryParams != nil {
-		if filename := queryParams["filename"]; filename != "" {
-			epubFilename = filename
-		}
-	}
-
-	// If not in query params, try request body (for POST requests)
-	if epubFilename == "" && request.Body != "" {
+	if request.Body != "" {
 		var bodyData map[string]string
 		if err := json.Unmarshal([]byte(request.Body), &bodyData); err == nil {
 			if filename := bodyData["filename"]; filename != "" {
@@ -69,7 +66,7 @@ func handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 
 	// Validate filename
 	if epubFilename == "" {
-		return createErrorResponse(400, "Missing 'filename' parameter. Provide EPUB filename as query parameter (?filename=...) or in request body ({\"filename\":\"...\"})"), nil
+		return createErrorResponse(400, "Missing 'filename' parameter. Provide EPUB filename in request body: {\"filename\":\"...\"}"), nil
 	}
 
 	// Sanitize filename (remove leading slashes, prevent path traversal)
