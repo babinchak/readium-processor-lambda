@@ -1,0 +1,15 @@
+# IDE
+.cursor/
+.vscode/
+
+# Build artifacts
+bootstrap
+function.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go test binaries
+*.test
+*.out
