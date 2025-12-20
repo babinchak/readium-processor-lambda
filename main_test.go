@@ -24,6 +24,44 @@ func teardownTestEnv() {
 	os.Unsetenv(supabaseServiceKeyEnvVar)
 }
 
+func TestHandler_FilenameInBody(t *testing.T) {
+	ctx := context.Background()
+	setupTestEnv()
+	defer teardownTestEnv()
+
+	testFilename := "8f1acca6-4d96-410c-ba90-bfa06c451b72/c9170176-8372-48c7-897d-f6bfe6ea3eef.epub"
+	bodyJSON, _ := json.Marshal(map[string]string{"filename": testFilename})
+
+	request := events.LambdaFunctionURLRequest{
+		RequestContext: events.LambdaFunctionURLRequestContext{
+			HTTP: events.LambdaFunctionURLRequestContextHTTPDescription{
+				Method: "POST",
+				Path:   "/",
+			},
+		},
+		RawPath: "/",
+		Body:    string(bodyJSON),
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+	}
+
+	response, err := handler(ctx, request)
+	if err != nil {
+		t.Fatalf("Handler returned error: %v", err)
+	}
+
+	// This will likely return 500 if the file doesn't exist, which is expected
+	// For a real test, you'd need a valid Supabase setup or mock the HTTP client
+	if response.StatusCode < 400 {
+		var body Response
+		if err := json.Unmarshal([]byte(response.Body), &body); err != nil {
+			t.Fatalf("Failed to unmarshal response: %v", err)
+		}
+		t.Logf("Response: %+v", body)
+	}
+}
+
 func TestHandler_MissingEnvVars(t *testing.T) {
 	ctx := context.Background()
 	teardownTestEnv()
@@ -155,43 +193,5 @@ func TestHandler_InvalidFilename_PathTraversal(t *testing.T) {
 	var errorBody ErrorResponse
 	if err := json.Unmarshal([]byte(response.Body), &errorBody); err != nil {
 		t.Fatalf("Failed to unmarshal error response: %v", err)
-	}
-}
-
-func TestHandler_FilenameInBody(t *testing.T) {
-	ctx := context.Background()
-	setupTestEnv()
-	defer teardownTestEnv()
-
-	testFilename := "8f1acca6-4d96-410c-ba90-bfa06c451b72/c9170176-8372-48c7-897d-f6bfe6ea3eef.epub"
-	bodyJSON, _ := json.Marshal(map[string]string{"filename": testFilename})
-
-	request := events.LambdaFunctionURLRequest{
-		RequestContext: events.LambdaFunctionURLRequestContext{
-			HTTP: events.LambdaFunctionURLRequestContextHTTPDescription{
-				Method: "POST",
-				Path:   "/",
-			},
-		},
-		RawPath: "/",
-		Body:    string(bodyJSON),
-		Headers: map[string]string{
-			"Content-Type": "application/json",
-		},
-	}
-
-	response, err := handler(ctx, request)
-	if err != nil {
-		t.Fatalf("Handler returned error: %v", err)
-	}
-
-	// This will likely return 500 if the file doesn't exist, which is expected
-	// For a real test, you'd need a valid Supabase setup or mock the HTTP client
-	if response.StatusCode < 400 {
-		var body Response
-		if err := json.Unmarshal([]byte(response.Body), &body); err != nil {
-			t.Fatalf("Failed to unmarshal response: %v", err)
-		}
-		t.Logf("Response: %+v", body)
 	}
 }
