@@ -7,6 +7,7 @@ A Go-based AWS Lambda function that processes EPUB files using the Readium Go to
 - Go 1.21 or later
 - AWS CLI configured
 - AWS SAM CLI (optional, for local testing)
+- Supabase project with storage bucket configured
 
 ## Project Structure
 
@@ -51,6 +52,64 @@ This will:
 - `make clean` - Clean build artifacts
 - `make deps` - Update dependencies
 
+## Environment Variables
+
+The Lambda function requires the following environment variables:
+
+- `SUPABASE_URL` - Your Supabase project URL (e.g., `https://your-project.supabase.co`)
+- `SUPABASE_SERVICE_ROLE_KEY` - Your Supabase service role key (for authenticated storage access)
+
+### Local Testing
+
+For local testing, you can use a `.env` file in the project root:
+
+**Create `.env` file:**
+```env
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+```
+
+The `.env` file is automatically loaded when running locally. The `.env` file is gitignored, so your credentials won't be committed.
+
+**Alternatively, you can set environment variables directly:**
+
+**Windows (PowerShell):**
+```powershell
+$env:SUPABASE_URL="https://your-project.supabase.co"
+$env:SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
+```
+
+**Linux/Mac:**
+```bash
+export SUPABASE_URL="https://your-project.supabase.co"
+export SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
+```
+
+## API Usage
+
+The Lambda accepts EPUB filenames (relative paths within the `epub-files` bucket) via:
+
+**GET request with query parameter:**
+```
+GET https://your-lambda-url/?filename=path/to/file.epub
+```
+
+**POST request with JSON body:**
+```json
+POST https://your-lambda-url/
+{
+  "filename": "path/to/file.epub"
+}
+```
+
+Example filename format: `c68d1328-863d-4e7a-92d9-ffbf0135d3dc/1e7ce2b0-3b17-419e-85a6-f849cd107602.epub`
+
+The Lambda will:
+1. Construct the Supabase storage URL from the filename
+2. Download the EPUB file using the service role key for authentication
+3. Validate the EPUB file format
+4. Return a success response with file size information
+
 ## Deployment
 
 ### Using AWS CLI
@@ -63,7 +122,8 @@ aws lambda create-function \
   --architectures arm64 \
   --role arn:aws:iam::YOUR_ACCOUNT_ID:role/lambda-execution-role \
   --handler bootstrap \
-  --zip-file fileb://function.zip
+  --zip-file fileb://function.zip \
+  --environment Variables="{SUPABASE_URL=https://your-project.supabase.co,SUPABASE_SERVICE_ROLE_KEY=your-service-role-key}"
 ```
 
 2. Create a Function URL:
@@ -79,9 +139,53 @@ aws lambda create-function-url-config \
 aws lambda get-function-url-config --function-name readium-processor
 ```
 
-### Using Terraform (optional)
+### Updating Environment Variables
 
-You can also use Terraform or AWS CDK for infrastructure as code.
+To update environment variables after deployment:
+
+```bash
+aws lambda update-function-configuration \
+  --function-name readium-processor \
+  --environment Variables="{SUPABASE_URL=https://your-project.supabase.co,SUPABASE_SERVICE_ROLE_KEY=your-service-role-key}"
+```
+
+### Using Terraform
+
+Example Terraform configuration:
+
+```hcl
+resource "aws_lambda_function" "readium_processor" {
+  filename         = "function.zip"
+  function_name    = "readium-processor"
+  role            = aws_iam_role.lambda_exec.arn
+  handler         = "bootstrap"
+  runtime         = "provided.al2023"
+  architectures   = ["arm64"]
+
+  environment {
+    variables = {
+      SUPABASE_URL              = "https://your-project.supabase.co"
+      SUPABASE_SERVICE_ROLE_KEY = var.supabase_service_role_key  # Use variable or secret
+    }
+  }
+}
+
+resource "aws_lambda_function_url" "readium_processor" {
+  function_name      = aws_lambda_function.readium_processor.function_name
+  authorization_type = "NONE"
+
+  cors {
+    allow_origins = ["*"]
+    allow_methods = ["GET", "POST"]
+    allow_headers = ["*"]
+  }
+}
+```
+
+**Note:** For sensitive values like `SUPABASE_SERVICE_ROLE_KEY`, consider using:
+- Terraform variables with `sensitive = true`
+- AWS Secrets Manager
+- AWS Systems Manager Parameter Store
 
 ## Testing
 
@@ -111,10 +215,12 @@ You can also right-click on a test function name and select "Debug Test" from th
 
 ## Next Steps
 
+- [x] Add Supabase authentication
+- [x] Add Supabase storage integration
 - [ ] Integrate Readium Go toolkit
-- [ ] Add Supabase authentication
 - [ ] Implement EPUB processing logic
-- [ ] Add Supabase storage integration
+- [ ] Generate manifest and reading order files
+- [ ] Upload processed files back to Supabase storage
 
 ## Notes
 
