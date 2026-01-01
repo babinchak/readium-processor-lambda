@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -40,7 +41,7 @@ type ErrorResponse struct {
 const (
 	supabaseURLEnvVar        = "SUPABASE_URL"
 	supabaseServiceKeyEnvVar = "SUPABASE_SERVICE_ROLE_KEY"
-	epubBucket               = "epub-files"
+	epubBucket               = "epubs"
 	manifestBucket           = "readium-manifests"
 )
 
@@ -250,7 +251,17 @@ func processEPUB(epubData []byte, epubFilename, supabaseURL, serviceKey string) 
 		return "", fmt.Errorf("failed to extract and upload resources: %w", err)
 	}
 
+	// Generate and upload content.json and positions.json
+	// Files are stored at {basePath}/readium/ (without ~ since Supabase doesn't allow it)
+	// We use relative paths in manifest: readium/content.json (resolved relative to manifest)
+	_, _, err = generateAndUploadReadiumFiles(publication, &manifest, resourceMap, basePath, supabaseURL, serviceKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate and upload Readium files: %w", err)
+	}
+
 	// Generate manifest with Supabase URLs
+	// Note: We use relative paths for content.json and positions.json since we store them
+	// at readium/ (without ~) due to Supabase storage key restrictions
 	manifestJSON, err := generateManifestWithSupabaseURLs(&manifest, resourceMap, basePath, supabaseURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate manifest: %w", err)
@@ -274,7 +285,7 @@ func extractAndUploadResources(pub *pub.Publication, basePath, supabaseURL, serv
 	// Process reading order items
 	for _, link := range manifest.ReadingOrder {
 		hrefStr := link.Href.String()
-		if err := processResource(hrefStr, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
+		if err := processResource(hrefStr, &link, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
 			return nil, fmt.Errorf("failed to process reading order resource %s: %w", hrefStr, err)
 		}
 	}
@@ -289,7 +300,9 @@ func extractAndUploadResources(pub *pub.Publication, basePath, supabaseURL, serv
 				baseHref = hrefStr[:idx]
 			}
 			if baseHref != "" {
-				if err := processResource(baseHref, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
+				// Find the link in manifest for the base href
+				baseLink := findLinkInManifest(baseHref, &manifest)
+				if err := processResource(baseHref, baseLink, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
 					return nil, fmt.Errorf("failed to process TOC resource %s: %w", baseHref, err)
 				}
 			}
@@ -308,7 +321,9 @@ func extractAndUploadResources(pub *pub.Publication, basePath, supabaseURL, serv
 				baseHref = hrefStr[:idx]
 			}
 			if baseHref != "" {
-				if err := processResource(baseHref, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
+				// Find the link in manifest for the base href
+				baseLink := findLinkInManifest(baseHref, &manifest)
+				if err := processResource(baseHref, baseLink, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
 					// Log but don't fail - some links might not be resources
 					log.Printf("Warning: failed to process link resource %s: %v", baseHref, err)
 				}
@@ -319,7 +334,7 @@ func extractAndUploadResources(pub *pub.Publication, basePath, supabaseURL, serv
 	// Process resources
 	for _, link := range manifest.Resources {
 		hrefStr := link.Href.String()
-		if err := processResource(hrefStr, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
+		if err := processResource(hrefStr, &link, pub, basePath, supabaseURL, serviceKey, resourceMap); err != nil {
 			return nil, fmt.Errorf("failed to process resource %s: %w", hrefStr, err)
 		}
 	}
@@ -327,8 +342,36 @@ func extractAndUploadResources(pub *pub.Publication, basePath, supabaseURL, serv
 	return resourceMap, nil
 }
 
+// findLinkInManifest finds a link in the manifest by href
+func findLinkInManifest(href string, m *manifest.Manifest) *manifest.Link {
+	// Check reading order
+	for _, link := range m.ReadingOrder {
+		if link.Href.String() == href {
+			return &link
+		}
+	}
+	// Check resources
+	for _, link := range m.Resources {
+		if link.Href.String() == href {
+			return &link
+		}
+	}
+	// Check table of contents
+	for _, link := range m.TableOfContents {
+		linkHref := link.Href.String()
+		// Remove fragment for comparison
+		if idx := strings.Index(linkHref, "#"); idx >= 0 {
+			linkHref = linkHref[:idx]
+		}
+		if linkHref == href {
+			return &link
+		}
+	}
+	return nil
+}
+
 // processResource processes a single resource: reads it from publication and uploads to Supabase
-func processResource(href string, pub *pub.Publication, basePath, supabaseURL, serviceKey string, resourceMap map[string]string) error {
+func processResource(href string, manifestLink *manifest.Link, pub *pub.Publication, basePath, supabaseURL, serviceKey string, resourceMap map[string]string) error {
 	// Skip if already processed
 	if _, exists := resourceMap[href]; exists {
 		return nil
@@ -345,6 +388,9 @@ func processResource(href string, pub *pub.Publication, basePath, supabaseURL, s
 
 	// Read resource from publication using the fetcher
 	link := manifest.Link{Href: manifest.NewHREF(hrefURL)}
+	if manifestLink != nil {
+		link.MediaType = manifestLink.MediaType
+	}
 	resource := pub.Get(ctx, link)
 	defer resource.Close()
 
@@ -353,6 +399,25 @@ func processResource(href string, pub *pub.Publication, basePath, supabaseURL, s
 	resourceData, resErr := resource.Read(ctx, 0, 0)
 	if resErr != nil {
 		return fmt.Errorf("failed to read resource: %v", resErr)
+	}
+
+	// Check if this is an XHTML/HTML file that needs link rewriting
+	mediaType := link.MediaType
+	isXHTML := false
+	if mediaType != nil {
+		mtStr := mediaType.String()
+		if mtStr == "application/xhtml+xml" || mtStr == "text/html" {
+			isXHTML = true
+		}
+	}
+	// Fallback to file extension check
+	if !isXHTML && (strings.HasSuffix(href, ".xhtml") || strings.HasSuffix(href, ".html")) {
+		isXHTML = true
+	}
+
+	if isXHTML {
+		// Rewrite internal links in XHTML/HTML files
+		resourceData = rewriteLinksInXHTML(resourceData, href, resourceMap, basePath, supabaseURL)
 	}
 
 	// Create storage path: basePath/resourcePath
@@ -393,13 +458,110 @@ func convertLinkToSupabaseURL(hrefStr string, resourceMap map[string]string, bas
 	return supabaseResourceURL + fragment
 }
 
-// convertTOCLink converts a TOC link (which may have children) to a map with Supabase URLs
+// rewriteLinksInXHTML keeps relative hrefs relative - Thorium Reader resolves them against manifest base
+func rewriteLinksInXHTML(content []byte, currentHref string, resourceMap map[string]string, basePath, supabaseURL string) []byte {
+	// Convert content to string for regex processing
+	contentStr := string(content)
+
+	// Pattern to match href attributes in <a> tags
+	// Matches: href="relative/path.xhtml#fragment" or href='relative/path.xhtml#fragment'
+	hrefPattern := regexp.MustCompile(`(?i)(<a[^>]*\s+href=["'])([^"']+)(["'][^>]*>)`)
+
+	// Replace function - we'll normalize relative paths but keep them relative
+	modifiedContent := hrefPattern.ReplaceAllStringFunc(contentStr, func(match string) string {
+		parts := hrefPattern.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return match // Return original if pattern doesn't match
+		}
+
+		prefix := parts[1]    // <a ... href="
+		hrefValue := parts[2] // the href value
+		suffix := parts[3]    // " ...>
+
+		// Skip external URLs, data URIs, mailto, same-page anchors
+		if strings.HasPrefix(hrefValue, "http://") ||
+			strings.HasPrefix(hrefValue, "https://") ||
+			strings.HasPrefix(hrefValue, "mailto:") ||
+			strings.HasPrefix(hrefValue, "data:") ||
+			strings.HasPrefix(hrefValue, "#") {
+			return match // Keep external/absolute links as-is
+		}
+
+		// For internal relative links, keep them relative
+		// Thorium Reader will resolve them against the manifest base URL
+		// Just normalize the path (remove ./ and handle .. if needed)
+		normalized := normalizeRelativeLink(hrefValue)
+
+		return prefix + normalized + suffix
+	})
+
+	return []byte(modifiedContent)
+}
+
+// normalizeRelativeLink normalizes a relative link path while keeping it relative
+func normalizeRelativeLink(link string) string {
+	// Remove leading ./
+	link = strings.TrimPrefix(link, "./")
+	// Remove leading / if present (make it truly relative)
+	link = strings.TrimPrefix(link, "/")
+	// For now, assume links are already correct relative paths
+	// More complex normalization (handling ..) could be added if needed
+	return link
+}
+
+// getDirectoryFromHref extracts the directory path from an href
+func getDirectoryFromHref(href string) string {
+	// Remove leading slash
+	href = strings.TrimPrefix(href, "/")
+
+	// Find last slash
+	lastSlash := strings.LastIndex(href, "/")
+	if lastSlash == -1 {
+		return "" // No directory, just filename
+	}
+
+	return href[:lastSlash+1] // Include trailing slash
+}
+
+// resolveRelativePath resolves a relative path against a base directory
+func resolveRelativePath(relativePath, baseDir string) string {
+	// If relativePath is already absolute (starts with /), return as-is
+	if strings.HasPrefix(relativePath, "/") {
+		return strings.TrimPrefix(relativePath, "/")
+	}
+
+	// Combine baseDir and relativePath
+	combined := baseDir + relativePath
+
+	// Normalize the path (remove .. and .)
+	parts := strings.Split(combined, "/")
+	result := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			if len(result) > 0 {
+				result = result[:len(result)-1]
+			}
+			continue
+		}
+		result = append(result, part)
+	}
+
+	return strings.Join(result, "/")
+}
+
+// convertTOCLink converts a TOC link (which may have children) to a map with relative paths
 func convertTOCLink(link manifest.Link, resourceMap map[string]string, basePath, supabaseURL string) map[string]interface{} {
 	hrefStr := link.Href.String()
-	supabaseURLWithFragment := convertLinkToSupabaseURL(hrefStr, resourceMap, basePath, supabaseURL)
+	// Use relative path (relative to manifest.json location)
+	// Remove leading slash if present to ensure it's a relative path
+	relativeHref := strings.TrimPrefix(hrefStr, "/")
 
 	item := map[string]interface{}{
-		"href": supabaseURLWithFragment,
+		"href": relativeHref,
 	}
 	if link.Title != "" {
 		item["title"] = link.Title
@@ -420,27 +582,258 @@ func convertTOCLink(link manifest.Link, resourceMap map[string]string, basePath,
 	return item
 }
 
+// generateAndUploadReadiumFiles generates content.json and positions.json and uploads them to Supabase
+// Returns the Supabase URLs for these files so they can be referenced in the manifest
+func generateAndUploadReadiumFiles(publication *pub.Publication, manifest *manifest.Manifest, resourceMap map[string]string, basePath, supabaseURL, serviceKey string) (contentURL, positionsURL string, err error) {
+	// Generate positions.json
+	positionsJSON, err := generatePositionsJSON(publication, manifest, resourceMap, basePath, supabaseURL)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate positions.json: %w", err)
+	}
+
+	// Upload positions.json to readium/ directory (without ~ since Supabase doesn't allow it in keys)
+	// We'll use full URLs in manifest instead of ~readium/ paths
+	positionsPath := fmt.Sprintf("%s/readium/positions.json", basePath)
+	positionsURL, err = uploadToSupabase(positionsPath, positionsJSON, manifestBucket, supabaseURL, serviceKey)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to upload positions.json: %w", err)
+	}
+
+	// Generate content.json
+	contentJSON, err := generateContentJSON(manifest, resourceMap, basePath, supabaseURL)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate content.json: %w", err)
+	}
+
+	// Upload content.json to readium/ directory
+	contentPath := fmt.Sprintf("%s/readium/content.json", basePath)
+	contentURL, err = uploadToSupabase(contentPath, contentJSON, manifestBucket, supabaseURL, serviceKey)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to upload content.json: %w", err)
+	}
+
+	return contentURL, positionsURL, nil
+}
+
+// generatePositionsJSON generates the positions.json file based on reading order and content length
+// It calculates positions based on content length (approximately 1024 characters per position)
+func generatePositionsJSON(publication *pub.Publication, manifest *manifest.Manifest, resourceMap map[string]string, basePath, supabaseURL string) ([]byte, error) {
+	ctx := context.Background()
+	positions := make([]map[string]interface{}, 0)
+	
+	const charsPerPosition = 1024 // Standard: one position per 1024 characters
+	
+	// First pass: calculate total character count and positions per resource
+	type resourceInfo struct {
+		href        string
+		mediaType   string
+		charCount   int
+		numPositions int
+	}
+	
+	resourceInfos := make([]resourceInfo, 0, len(manifest.ReadingOrder))
+	totalChars := 0
+	
+	for i := range manifest.ReadingOrder {
+		link := &manifest.ReadingOrder[i]
+		hrefStr := link.Href.String()
+		
+		// Read the resource to get its content length
+		// Use the link directly from reading order
+		resource := publication.Get(ctx, *link)
+		if resource == nil {
+			log.Printf("Warning: failed to get resource %s", hrefStr)
+			continue
+		}
+		
+		// Read the resource content
+		resourceData, err := resource.Read(ctx, 0, 0)
+		resource.Close()
+		
+		if err != nil {
+			log.Printf("Warning: failed to read resource %s: %v", hrefStr, err)
+			continue
+		}
+		
+		// Count characters (for text-based resources)
+		charCount := len(string(resourceData))
+		numPositions := 1 // At least one position
+		if charCount > 0 {
+			// Calculate number of positions: at least 1, or based on content length
+			numPositions = (charCount + charsPerPosition - 1) / charsPerPosition // Ceiling division
+			if numPositions == 0 {
+				numPositions = 1
+			}
+		}
+		
+		mediaTypeStr := ""
+		if link.MediaType != nil {
+			mediaTypeStr = link.MediaType.String()
+		}
+		
+		resourceInfos = append(resourceInfos, resourceInfo{
+			href:        hrefStr,
+			mediaType:   mediaTypeStr,
+			charCount:   charCount,
+			numPositions: numPositions,
+		})
+		
+		totalChars += charCount
+	}
+	
+	// Second pass: generate positions with proper progression values
+	positionCounter := 1
+	cumulativeChars := 0
+	
+	for _, info := range resourceInfos {
+		relativeHref := strings.TrimPrefix(info.href, "/")
+		
+		// Generate positions for this resource
+		for i := 0; i < info.numPositions; i++ {
+			// Calculate progression within this document (0.0 to 1.0)
+			var progression float64
+			if info.numPositions > 1 {
+				progression = float64(i) / float64(info.numPositions-1)
+			} else {
+				progression = 0.0
+			}
+			
+			// Calculate totalProgression across entire publication
+			var totalProgression float64
+			if totalChars > 0 {
+				// Estimate position in total content based on cumulative chars
+				// Add proportional contribution for this position within the resource
+				charsAtPosition := cumulativeChars + (i * info.charCount / info.numPositions)
+				totalProgression = float64(charsAtPosition) / float64(totalChars)
+				if totalProgression > 1.0 {
+					totalProgression = 1.0
+				}
+			}
+			
+			position := map[string]interface{}{
+				"href": relativeHref,
+				"locations": map[string]interface{}{
+					"position":         positionCounter,
+					"progression":      progression,
+					"totalProgression": totalProgression,
+				},
+			}
+			
+			// Add type if available
+			if info.mediaType != "" {
+				position["type"] = info.mediaType
+			}
+			
+			positions = append(positions, position)
+			positionCounter++
+		}
+		
+		cumulativeChars += info.charCount
+	}
+	
+	positionsData := map[string]interface{}{
+		"total":    len(positions),
+		"positions": positions,
+	}
+	
+	return json.MarshalIndent(positionsData, "", "  ")
+}
+
+// buildContentItemFromLink converts a TOC link to a content item structure
+func buildContentItemFromLink(link manifest.Link, resourceMap map[string]string, basePath, supabaseURL string) map[string]interface{} {
+	hrefStr := link.Href.String()
+	// Use relative path (relative to manifest.json location)
+	// Remove leading slash if present to ensure it's a relative path
+	relativeHref := strings.TrimPrefix(hrefStr, "/")
+
+	item := map[string]interface{}{
+		"href": relativeHref,
+	}
+
+	if link.Title != "" {
+		item["title"] = link.Title
+	}
+
+	if link.MediaType != nil {
+		item["type"] = link.MediaType.String()
+	}
+
+	// Recursively add children
+	if len(link.Children) > 0 {
+		children := make([]map[string]interface{}, 0, len(link.Children))
+		for _, child := range link.Children {
+			childItem := buildContentItemFromLink(child, resourceMap, basePath, supabaseURL)
+			children = append(children, childItem)
+		}
+		if len(children) > 0 {
+			item["children"] = children
+		}
+	}
+
+	return item
+}
+
+// generateContentJSON generates the content.json file based on table of contents
+func generateContentJSON(manifest *manifest.Manifest, resourceMap map[string]string, basePath, supabaseURL string) ([]byte, error) {
+	content := make([]map[string]interface{}, 0)
+	if len(manifest.TableOfContents) > 0 {
+		for _, link := range manifest.TableOfContents {
+			item := buildContentItemFromLink(link, resourceMap, basePath, supabaseURL)
+			content = append(content, item)
+		}
+	} else {
+		// If no TOC, use reading order as fallback
+		for _, link := range manifest.ReadingOrder {
+			hrefStr := link.Href.String()
+			// Use relative path (relative to manifest.json location)
+			// Remove leading slash if present to ensure it's a relative path
+			relativeHref := strings.TrimPrefix(hrefStr, "/")
+
+			item := map[string]interface{}{
+				"href": relativeHref,
+			}
+			if link.Title != "" {
+				item["title"] = link.Title
+			}
+			if link.MediaType != nil {
+				item["type"] = link.MediaType.String()
+			}
+			content = append(content, item)
+		}
+	}
+
+	contentData := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"numberOfItems": len(content),
+		},
+		"structure": content,
+	}
+
+	return json.MarshalIndent(contentData, "", "  ")
+}
+
 // generateManifestWithSupabaseURLs creates a new manifest with all URLs pointing to Supabase
 func generateManifestWithSupabaseURLs(manifest *manifest.Manifest, resourceMap map[string]string, basePath, supabaseURL string) ([]byte, error) {
+	// Construct manifest URL for self reference
+	manifestPath := fmt.Sprintf("%s/manifest.json", basePath)
+	manifestURL := fmt.Sprintf("%s/storage/v1/object/public/%s/%s", strings.TrimSuffix(supabaseURL, "/"), manifestBucket, manifestPath)
+
 	// Create a new manifest structure with updated URLs
 	updatedManifest := map[string]interface{}{
 		"@context": "https://readium.org/webpub-manifest/context.jsonld",
 		"metadata": manifest.Metadata,
 	}
 
-	// Update reading order with Supabase URLs
+	// Update reading order with relative paths
 	readingOrder := make([]map[string]interface{}, 0, len(manifest.ReadingOrder))
 	for _, link := range manifest.ReadingOrder {
 		hrefStr := link.Href.String()
-		supabaseResourceURL := resourceMap[hrefStr]
-		if supabaseResourceURL == "" {
-			// Fallback: construct URL if not in map
-			storagePath := fmt.Sprintf("%s/%s", basePath, strings.TrimPrefix(hrefStr, "/"))
-			supabaseResourceURL = fmt.Sprintf("%s/storage/v1/object/public/%s/%s", strings.TrimSuffix(supabaseURL, "/"), manifestBucket, storagePath)
-		}
+		// Use relative path (relative to manifest.json location)
+		// Remove leading slash if present to ensure it's a relative path
+		relativeHref := strings.TrimPrefix(hrefStr, "/")
 
 		item := map[string]interface{}{
-			"href": supabaseResourceURL,
+			"href": relativeHref,
 		}
 		if link.MediaType != nil {
 			item["type"] = link.MediaType.String()
@@ -464,7 +857,7 @@ func generateManifestWithSupabaseURLs(manifest *manifest.Manifest, resourceMap m
 		}
 	}
 
-	// Extract landmarks from Links (links with specific rel values that indicate landmarks)
+	// Extract landmarks from Links and TOC
 	// Common landmark rels: "contents", "start", "copyright", etc.
 	landmarkRels := map[string]bool{
 		"contents":  true,
@@ -472,6 +865,9 @@ func generateManifestWithSupabaseURLs(manifest *manifest.Manifest, resourceMap m
 		"copyright": true,
 	}
 	landmarks := make([]map[string]interface{}, 0)
+	landmarkHrefs := make(map[string]bool) // Track added landmarks to avoid duplicates
+
+	// First, extract landmarks from manifest.Links
 	for _, link := range manifest.Links {
 		// Check if this link has a rel that indicates it's a landmark
 		isLandmark := false
@@ -488,23 +884,109 @@ func generateManifestWithSupabaseURLs(manifest *manifest.Manifest, resourceMap m
 
 		if isLandmark {
 			hrefStr := link.Href.String()
-			supabaseURLWithFragment := convertLinkToSupabaseURL(hrefStr, resourceMap, basePath, supabaseURL)
+			// Use relative path (relative to manifest.json location)
+			// Remove leading slash if present to ensure it's a relative path
+			relativeHref := strings.TrimPrefix(hrefStr, "/")
 
 			item := map[string]interface{}{
-				"href": supabaseURLWithFragment,
+				"href": relativeHref,
 			}
 			if link.Title != "" {
 				item["title"] = link.Title
 			}
 			landmarks = append(landmarks, item)
+			landmarkHrefs[hrefStr] = true
 		}
 	}
+
+	// Also check TOC for common landmark patterns (Table of Contents, Begin Reading, Copyright)
+	if len(manifest.TableOfContents) > 0 {
+		for _, link := range manifest.TableOfContents {
+			hrefStr := link.Href.String()
+			// Skip if already added
+			if landmarkHrefs[hrefStr] {
+				continue
+			}
+
+			title := strings.ToLower(link.Title)
+			isLandmark := false
+			landmarkTitle := ""
+
+			// Check for common landmark titles
+			if strings.Contains(title, "table of contents") || strings.Contains(title, "contents") || strings.Contains(title, "toc") {
+				isLandmark = true
+				landmarkTitle = "Table of Contents"
+			} else if strings.Contains(title, "begin reading") || strings.Contains(title, "start") {
+				isLandmark = true
+				landmarkTitle = "Begin Reading"
+			} else if strings.Contains(title, "copyright") {
+				isLandmark = true
+				landmarkTitle = "Copyright Page"
+			}
+
+			if isLandmark {
+				// Use relative path (relative to manifest.json location)
+				// Remove leading slash if present to ensure it's a relative path
+				relativeHref := strings.TrimPrefix(hrefStr, "/")
+				item := map[string]interface{}{
+					"href": relativeHref,
+				}
+				if landmarkTitle != "" {
+					item["title"] = landmarkTitle
+				} else if link.Title != "" {
+					item["title"] = link.Title
+				}
+				landmarks = append(landmarks, item)
+				landmarkHrefs[hrefStr] = true
+			}
+		}
+	}
+
+	// If no landmarks found, try to infer from reading order (first item = Begin Reading)
+	if len(landmarks) == 0 && len(manifest.ReadingOrder) > 0 {
+		firstLink := manifest.ReadingOrder[0]
+		hrefStr := firstLink.Href.String()
+		// Use relative path (relative to manifest.json location)
+		// Remove leading slash if present to ensure it's a relative path
+		relativeHref := strings.TrimPrefix(hrefStr, "/")
+		landmarks = append(landmarks, map[string]interface{}{
+			"href":  relativeHref,
+			"title": "Begin Reading",
+		})
+	}
+
 	if len(landmarks) > 0 {
 		updatedManifest["landmarks"] = landmarks
 	}
 
-	// Update links with Supabase URLs (for non-landmark links)
-	links := make([]map[string]interface{}, 0, len(manifest.Links))
+	// Build links array - always include required Readium links
+	links := make([]map[string]interface{}, 0)
+
+	// Add self reference (required)
+	links = append(links, map[string]interface{}{
+		"href": manifestURL,
+		"rel":  "self",
+		"type": "application/webpub+json",
+	})
+
+	// Add Readium-specific links (content.json and positions.json)
+	// Use relative paths: readium/content.json (without ~) since:
+	// 1. Supabase doesn't allow ~ in storage keys, so we store at readium/
+	// 2. Readers will resolve relative to manifest: {basePath}/readium/content.json
+	// 3. This matches where we actually stored the files
+	links = append(links, map[string]interface{}{
+		"href": "readium/content.json",
+		"type": "application/vnd.readium.content+json",
+	})
+	links = append(links, map[string]interface{}{
+		"href": "readium/positions.json",
+		"type": "application/vnd.readium.position-list+json",
+	})
+
+	// Extract license links from manifest.Links (they may have rel="http://creativecommons.org/ns#license")
+	// We'll add these when processing manifest.Links below
+
+	// Add non-landmark links from manifest.Links
 	for _, link := range manifest.Links {
 		// Skip links that are landmarks (already added above)
 		isLandmark := false
@@ -519,10 +1001,11 @@ func generateManifestWithSupabaseURLs(manifest *manifest.Manifest, resourceMap m
 		}
 
 		hrefStr := link.Href.String()
-		// Only convert internal links to Supabase URLs
+		// Use relative paths for internal links, keep external URLs as-is
 		if !strings.HasPrefix(hrefStr, "http://") && !strings.HasPrefix(hrefStr, "https://") && !strings.HasPrefix(hrefStr, "~") {
-			supabaseURLWithFragment := convertLinkToSupabaseURL(hrefStr, resourceMap, basePath, supabaseURL)
-			hrefStr = supabaseURLWithFragment
+			// Use relative path (relative to manifest.json location)
+			// Remove leading slash if present to ensure it's a relative path
+			hrefStr = strings.TrimPrefix(hrefStr, "/")
 		}
 
 		item := map[string]interface{}{
@@ -540,23 +1023,20 @@ func generateManifestWithSupabaseURLs(manifest *manifest.Manifest, resourceMap m
 		}
 		links = append(links, item)
 	}
-	if len(links) > 0 {
-		updatedManifest["links"] = links
-	}
 
-	// Update resources with Supabase URLs
+	// Always include links array (required by Readium spec)
+	updatedManifest["links"] = links
+
+	// Update resources with relative paths
 	resources := make([]map[string]interface{}, 0, len(manifest.Resources))
 	for _, link := range manifest.Resources {
 		hrefStr := link.Href.String()
-		supabaseResourceURL := resourceMap[hrefStr]
-		if supabaseResourceURL == "" {
-			// Fallback: construct URL if not in map
-			storagePath := fmt.Sprintf("%s/%s", basePath, strings.TrimPrefix(hrefStr, "/"))
-			supabaseResourceURL = fmt.Sprintf("%s/storage/v1/object/public/%s/%s", strings.TrimSuffix(supabaseURL, "/"), manifestBucket, storagePath)
-		}
+		// Use relative path (relative to manifest.json location)
+		// Remove leading slash if present to ensure it's a relative path
+		relativeHref := strings.TrimPrefix(hrefStr, "/")
 
 		item := map[string]interface{}{
-			"href": supabaseResourceURL,
+			"href": relativeHref,
 		}
 		if link.MediaType != nil {
 			item["type"] = link.MediaType.String()
@@ -595,6 +1075,53 @@ func generateManifestWithSupabaseURLs(manifest *manifest.Manifest, resourceMap m
 	return manifestJSON, nil
 }
 
+// getContentType determines the content type based on file extension and path
+func getContentType(path string) string {
+	pathLower := strings.ToLower(path)
+	
+	// Check for specific Readium JSON files first
+	if strings.HasSuffix(pathLower, "manifest.json") {
+		return "application/webpub+json; charset=utf-8"
+	}
+	if strings.HasSuffix(pathLower, "content.json") {
+		return "application/vnd.readium.content+json; charset=utf-8"
+	}
+	if strings.HasSuffix(pathLower, "positions.json") {
+		return "application/vnd.readium.position-list+json; charset=utf-8"
+	}
+	
+	// Check file extension for other files
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".html", ".htm":
+		return "text/html"
+	case ".xhtml":
+		return "application/xhtml+xml"
+	case ".css":
+		return "text/css"
+	case ".js":
+		return "application/javascript"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".svg":
+		return "image/svg+xml"
+	case ".xml":
+		return "application/xml"
+	case ".ncx":
+		return "application/x-dtbncx+xml"
+	case ".opf":
+		return "application/oebps-package+xml"
+	default:
+		return "application/octet-stream"
+	}
+}
+
 // uploadToSupabase uploads data to Supabase storage
 func uploadToSupabase(path string, data []byte, bucket, supabaseURL, serviceKey string) (string, error) {
 	// Construct upload URL
@@ -609,12 +1136,20 @@ func uploadToSupabase(path string, data []byte, bucket, supabaseURL, serviceKey 
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Determine content type from file extension
+	contentType := getContentType(path)
+
 	// Set Supabase authentication headers
 	req.Header.Set("apikey", serviceKey)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", serviceKey))
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("x-upsert", "true") // Upsert to allow overwriting
 	req.Header.Set("User-Agent", "Readium-Processor-Lambda/1.0")
+	
+	// Set Content-Disposition to inline for JSON files so browsers display them instead of downloading
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		req.Header.Set("Content-Disposition", "inline")
+	}
 
 	// Execute request
 	resp, err := client.Do(req)

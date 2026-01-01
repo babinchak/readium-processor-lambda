@@ -29,7 +29,7 @@ func TestHandler_FilenameInBody(t *testing.T) {
 	setupTestEnv()
 	defer teardownTestEnv()
 
-	testFilename := "8f1acca6-4d96-410c-ba90-bfa06c451b72/c9170176-8372-48c7-897d-f6bfe6ea3eef.epub"
+	testFilename := "books/ec9e1729-f168-4718-baca-028ab1430a03/8c34a7b4-7222-492c-8100-4d25e7fedc87.epub"
 	bodyJSON, _ := json.Marshal(map[string]string{"filename": testFilename})
 
 	request := events.LambdaFunctionURLRequest{
